@@ -11,3 +11,10 @@ venv
 demix
 spec
 tests
+cloud_data
+assets
+*.env
+.env*
+*.gguf
+*.pt
+*.pth
