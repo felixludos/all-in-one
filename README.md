@@ -20,6 +20,7 @@ This package provides models for music structure analysis, predicting:
 **Table of Contents**
 
 - [Installation](#installation)
+- [HTTP API and Docker](#http-api-and-docker)
 - [Usage for CLI](#usage-for-cli)
 - [Usage for Python](#usage-for-python)
 - [Visualization & Sonification](#visualization--sonification)
@@ -68,6 +69,186 @@ For macOS:
 brew install ffmpeg
 ```
 
+
+## HTTP API and Docker
+
+The repository includes a FastAPI service without changing the existing CLI or
+Python API. OpenAPI documentation is available at
+[http://localhost:4434/docs](http://localhost:4434/docs), and the readiness
+endpoint is `GET /health`.
+
+### GPU build and launch
+
+Docker Engine, Docker Compose v2, the NVIDIA driver, and the NVIDIA Container
+Toolkit are required. The default Compose file reserves one GPU and deliberately
+runs one Uvicorn worker so model copies cannot contend for GPU memory.
+
+```shell
+docker compose up -d --build
+docker compose ps
+curl --fail http://localhost:4434/health
+```
+
+The service is then available at `http://localhost:4434`. Model downloads are
+cached in the named `model-cache` volume and survive container recreation.
+`restart: unless-stopped` restarts the service after Docker or the host
+restarts. The first real analysis can take longer while Demucs and All-In-One
+weights are downloaded.
+
+### Analyze with curl
+
+A normal request returns JSON:
+
+```shell
+curl --fail-with-body \
+  -F 'files=@song.wav' \
+  -F 'device=cuda' \
+  http://localhost:4434/analyze
+```
+
+Repeat the `files` field to analyze more than one track. Requests that ask for
+generated files, retained byproducts, activations, or embeddings return a ZIP:
+
+```shell
+curl --fail-with-body \
+  -F 'files=@song.wav' \
+  -F 'visualize=true' \
+  -F 'sonify=true' \
+  -F 'include_activations=true' \
+  -F 'include_embeddings=true' \
+  -o allin1-results.zip \
+  http://localhost:4434/analyze
+unzip allin1-results.zip -d allin1-results
+```
+
+The archive contains `results.json`, generated visualizations/sonifications,
+and requested data arrays. Activations use compressed NumPy `.npz`; embeddings
+use `.npy`. Their paths and formats are referenced from `results.json`.
+Retained Demucs audio and spectrograms can be very large.
+
+All `allin1.analyze()` options are multipart form fields:
+
+| Field | API default | Notes |
+| --- | --- | --- |
+| `out_dir` | unset | Relative archive directory; setting it makes the response a ZIP. |
+| `visualize` | `false` | Boolean, or a relative archive directory. |
+| `sonify` | `false` | Boolean, or a relative archive directory. |
+| `model` | `harmonix-all` | Pretrained model name. |
+| `device` | CUDA when available, otherwise CPU | May also be set by `ALLIN1_DEFAULT_DEVICE`. |
+| `include_activations` | `false` | Returned as `.npz` in a ZIP. |
+| `include_embeddings` | `false` | Returned as `.npy` in a ZIP. |
+| `demix_dir` | `./demix` | Relative, request-isolated archive directory. |
+| `spec_dir` | `./spec` | Relative, request-isolated archive directory. |
+| `keep_byproducts` | `false` | Includes demixed audio and spectrograms in a ZIP. |
+| `overwrite` | `false` | Forwarded unchanged; workspaces are new per request. |
+| `multiprocess` | `true` | Forwarded to analysis preprocessing and generators. |
+
+For safety, path fields are interpreted inside a temporary per-request
+workspace. Absolute paths and `..` traversal are rejected. The workspace,
+including uploaded audio, is removed after the response completes.
+
+### Python client
+
+```python
+from pathlib import Path
+
+import requests
+
+with Path("song.wav").open("rb") as audio:
+    response = requests.post(
+        "http://localhost:4434/analyze",
+        files={"files": ("song.wav", audio, "audio/wav")},
+        data={"device": "cuda", "visualize": "false"},
+        timeout=None,
+    )
+response.raise_for_status()
+
+if response.headers["content-type"].startswith("application/zip"):
+    Path("allin1-results.zip").write_bytes(response.content)
+else:
+    print(response.json())
+```
+
+For multiple uploads, pass a list of `("files", (...))` tuples to
+`requests.post(files=...)`.
+
+### CPU fallback
+
+The same CUDA-runtime image can execute on CPU without exposing a GPU. Use the
+standalone CPU Compose file:
+
+```shell
+docker compose -f compose.cpu.yaml up -d --build
+curl --fail http://localhost:4434/health
+```
+
+CPU analysis, especially Demucs separation, is substantially slower. Send
+`device=cpu`, which is already the default in the CPU Compose file.
+
+### LAN access
+
+The published port listens on all host interfaces. From another machine use
+`http://HOST_LAN_IP:4434` after allowing TCP port 4434 in the host firewall.
+The port number does not enable TLS: this service speaks plain HTTP.
+
+### Configuration and security
+
+`ALLIN1_MAX_UPLOAD_MB` limits each file (default 200 MiB), and
+`ALLIN1_MAX_FILES` limits files per request (default 8). The service also
+limits total concurrent work and serializes GPU work by default with
+`ALLIN1_MAX_CONCURRENT_JOBS=1` and `ALLIN1_MAX_CONCURRENT_GPU_JOBS=1`.
+Keep one Uvicorn worker when using a GPU; process-local locks cannot coordinate
+multiple workers.
+
+The service has no authentication or TLS. Do not expose it directly to the
+public internet. For shared networks, place it behind an authenticated,
+rate-limited HTTPS reverse proxy, restrict firewall sources, set conservative
+upload limits, and monitor disk/GPU usage. Uploaded filenames are sanitized and
+audio extensions are allow-listed, but uploaded media must still be treated as
+untrusted data by the surrounding deployment.
+
+### Development tests with uv
+
+Python 3.10 is required for the pinned GPU wheels. Create a local uv-managed
+environment with the same locked stack:
+
+```shell
+uv venv --python 3.10
+uv pip install --python .venv/bin/python Cython==0.29.37 numpy==1.23.5 scipy==1.10.1
+uv pip install --python .venv/bin/python --no-build-isolation \
+  --extra-index-url https://download.pytorch.org/whl/cu118 \
+  -r constraints.docker.txt
+uv pip install --python .venv/bin/python --no-deps -e .
+uv pip install --python .venv/bin/python pytest==8.3.4
+uv run --no-sync pytest tests/test_api.py
+```
+
+The local install downloads the large CUDA PyTorch wheel. The Docker image
+remains the authoritative environment for the pinned legacy PyTorch, NATTEN,
+and madmom stack.
+
+### Troubleshooting and compatibility
+
+- If Compose reports that no matching GPU device exists, verify
+  `nvidia-smi` on the host and install/configure NVIDIA Container Toolkit, or
+  use `compose.cpu.yaml`.
+- If `/health` works but the first analysis is slow or fails offline, allow
+  outbound access for the initial model downloads or pre-populate the
+  `model-cache` volume.
+- Inspect failures with `docker compose logs -f api`; confirm FFmpeg with
+  `docker compose exec api ffmpeg -version`.
+- A 413 response means the configured upload limit was exceeded. A 415 response
+  means the filename extension is not in `ALLIN1_AUDIO_EXTENSIONS`.
+- The retired legacy NATTEN host has an expired TLS certificate; the image uses
+  the same official 0.14.6 release asset from GitHub instead.
+- The image pins PyTorch 2.0.0, torchaudio 2.0.1, CUDA 11.8, and NATTEN 0.14.6.
+  All-In-One uses legacy neighborhood-attention functions that are not
+  source-compatible with current NATTEN releases.
+- NumPy is pinned below 1.24 because madmom 0.16.1 still uses aliases removed in
+  NumPy 1.24. A small package-initialization shim restores the madmom
+  `collections.MutableSequence` import removed in Python 3.10. These older ML
+  dependencies are the main upstream compatibility constraint and should be
+  upgraded together, with inference regression tests.
 
 ## Usage for CLI
 

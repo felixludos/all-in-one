@@ -1,0 +1,28 @@
+services:
+  api:
+    build:
+      context: .
+    image: allin1-api:1.1.0
+    ports:
+      - "4434:8000"
+    environment:
+      ALLIN1_DEFAULT_DEVICE: cuda
+      ALLIN1_MAX_UPLOAD_MB: ${ALLIN1_MAX_UPLOAD_MB:-200}
+      ALLIN1_MAX_FILES: ${ALLIN1_MAX_FILES:-8}
+      ALLIN1_MAX_CONCURRENT_JOBS: "1"
+      ALLIN1_MAX_CONCURRENT_GPU_JOBS: "1"
+    volumes:
+      - model-cache:/cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    init: true
+    shm_size: "1gb"
+
+volumes:
+  model-cache:
